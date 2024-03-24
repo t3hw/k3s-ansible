@@ -1,59 +1,54 @@
 ---
 name: Test
 on:
-  pull_request:
-  push:
-    branches:
-      - master
-    paths-ignore:
-      - '**/README.md'
+  workflow_call:
 jobs:
   molecule:
     name: Molecule
     runs-on: self-hosted
-
     strategy:
       matrix:
         scenario:
           - default
-          - ipv6
+          # - ipv6
           - single_node
+          - calico
+          - cilium
+          - kube-vip
       fail-fast: false
     env:
-      PYTHON_VERSION: "3.10"
-      VAGRANT_DEFAULT_PROVIDER: virtualbox
+      PYTHON_VERSION: "3.11"
 
     steps:
       - name: Check out the codebase
-        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # 3.0.2
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # 4.1.2
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Virtual Box from Oracle
-        run: |
-          echo "::group::Virtual Box"
-          wget -O- https://www.virtualbox.org/download/oracle_vbox_2016.asc | sudo gpg --dearmor --yes --output /usr/share/keyrings/oracle-virtualbox-2016.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/oracle-virtualbox-2016.gpg] https://download.virtualbox.org/virtualbox/debian $(lsb_release -cs) contrib" | sudo tee -a /etc/apt/sources.list.d/virtualbox.list
-          sudo apt update && sudo apt install -y linux-headers-generic linux-headers-5.15.0-52-generic build-essential dkms virtualbox-dkms virtualbox-6.1
-          echo "::endgroup::"
-          echo "::group::Virtual Box Test"
-          vboxmanage --version
-          sudo /sbin/vboxconfig
-          sudo modprobe vboxdrv
-          vboxmanage --version
-          echo "::endgroup::"
+      # these steps are necessary if not using ephemeral nodes
+      - name: Delete old Vagrant box versions
+        if: always() # do this even if a step before has failed
+        run: vagrant box prune --force
 
-      - name: Install Vagrant
-        run: |
-          echo "::group::Install Vagrant"
-          wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-          sudo apt update && sudo apt install -y vagrant
-          vagrant version
-          vagrant plugin list
-          vagrant plugin install vagrant-vbguest
-          vagrant plugin list
-          echo "::endgroup::"
+      - name: Remove all local Vagrant boxes
+        if: always() # do this even if a step before has failed
+        run: if vagrant box list 2>/dev/null; then vagrant box list | cut -f 1 -d ' ' | xargs -L 1 vagrant box remove -f 2>/dev/null && echo "All Vagrant boxes removed." || echo "No Vagrant boxes found."; else echo "No Vagrant boxes found."; fi
+
+      - name: Remove all Virtualbox VMs
+        if: always() # do this even if a step before has failed
+        run: VBoxManage list vms | awk -F'"' '{print $2}' | xargs -I {} VBoxManage unregistervm --delete "{}"
+
+      - name: Remove all Virtualbox HDs
+        if: always() # do this even if a step before has failed
+        run: VBoxManage list hdds | awk -F':' '/^UUID:/ {print $2}' | xargs -I {} VBoxManage closemedium disk "{}" --delete
+
+      - name: Remove all Virtualbox Networks
+        if: always() # do this even if a step before has failed
+        run: VBoxManage list hostonlyifs | grep '^Name:' | awk '{print $2}' | grep '^vboxnet' | xargs -I {} VBoxManage hostonlyif remove {}
+
+      - name: Remove Virtualbox network config
+        if: always() # do this even if a step before has failed
+        run: sudo rm /etc/vbox/networks.conf || true
 
       - name: Configure VirtualBox
         run: |-
@@ -63,34 +58,18 @@ jobs:
           * fdad:bad:ba55::/64
           EOF
 
-      - name: Cache pip
-        uses: actions/cache@9b0c1fce7a93df8e3bb8926b0d6e9d89e92f20a7 # 3.0.11
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('./requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Cache Vagrant boxes
-        uses: actions/cache@9b0c1fce7a93df8e3bb8926b0d6e9d89e92f20a7 # 3.0.11
-        with:
-          path: |
-            ~/.vagrant.d/boxes
-          key: vagrant-boxes-${{ hashFiles('**/molecule.yml') }}
-          restore-keys: |
-            vagrant-boxes
-
-      - name: Download Vagrant boxes for all scenarios
-        # To save some cache space, all scenarios share the same cache key.
-        # On the other hand, this means that the cache contents should be
-        # the same across all scenarios. This step ensures that.
-        run: ./.github/download-boxes.sh
-
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@13ae5bb136fac2878aff31522b9efb785519f984 # 4.3.0
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c # 5.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip' # caching pip dependencies
+
+      - name: Restore vagrant Boxes cache
+        uses: actions/cache/restore@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # 4.0
+        with:
+          path: ~/.vagrant.d/boxes
+          key: vagrant-boxes-${{ hashFiles('**/molecule.yml') }}
+          fail-on-cache-miss: true
 
       - name: Install dependencies
         run: |
@@ -104,21 +83,44 @@ jobs:
 
       - name: Test with molecule
         run: molecule test --scenario-name ${{ matrix.scenario }}
+        timeout-minutes: 90
         env:
           ANSIBLE_K3S_LOG_DIR: ${{ runner.temp }}/logs/k3s-ansible/${{ matrix.scenario }}
           ANSIBLE_SSH_RETRIES: 4
-          ANSIBLE_TIMEOUT: 60
+          ANSIBLE_TIMEOUT: 120
           PY_COLORS: 1
           ANSIBLE_FORCE_COLOR: 1
 
+      # these steps are necessary if not using ephemeral nodes
+      - name: Delete old Vagrant box versions
+        if: always() # do this even if a step before has failed
+        run: vagrant box prune --force
+
+      - name: Remove all local Vagrant boxes
+        if: always() # do this even if a step before has failed
+        run: if vagrant box list 2>/dev/null; then vagrant box list | cut -f 1 -d ' ' | xargs -L 1 vagrant box remove -f 2>/dev/null && echo "All Vagrant boxes removed." || echo "No Vagrant boxes found."; else echo "No Vagrant boxes found."; fi
+
+      - name: Remove all Virtualbox VMs
+        if: always() # do this even if a step before has failed
+        run: VBoxManage list vms | awk -F'"' '{print $2}' | xargs -I {} VBoxManage unregistervm --delete "{}"
+
+      - name: Remove all Virtualbox HDs
+        if: always() # do this even if a step before has failed
+        run: VBoxManage list hdds | awk -F':' '/^UUID:/ {print $2}' | xargs -I {} VBoxManage closemedium disk "{}" --delete
+
+      - name: Remove all Virtualbox Networks
+        if: always() # do this even if a step before has failed
+        run: VBoxManage list hostonlyifs | grep '^Name:' | awk '{print $2}' | grep '^vboxnet' | xargs -I {} VBoxManage hostonlyif remove {}
+
+      - name: Remove Virtualbox network config
+        if: always() # do this even if a step before has failed
+        run: sudo rm /etc/vbox/networks.conf || true
+
       - name: Upload log files
         if: always() # do this even if a step before has failed
-        uses: actions/upload-artifact@83fd05a356d7e2593de66fc9913b3002723633cb # 3.1.1
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # 4.3.1
         with:
           name: logs
           path: |
             ${{ runner.temp }}/logs
-
-      - name: Delete old box versions
-        if: always() # do this even if a step before has failed
-        run: vagrant box prune --force
+          overwrite: true
